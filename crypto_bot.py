@@ -1282,6 +1282,7 @@ def run() -> None:
 
         log.info("=== SOL MM v6 stopped ===")
 
-
 if __name__ == "__main__":
-    run()
+    _spot_feed = _WSFeed("wss://stream.binance.com:9443/ws/solusdt@aggTrade","Binance-spot")
+    _perp_feed = _WSFeed("wss://fstream.binance.com/ws/solusdt@aggTrade","Binance-perp")
+    run_bot()
