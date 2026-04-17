@@ -23,6 +23,11 @@ def test_fill_tracker_adverse():
 
 def test_compute_skewed_bids():
     # Remove 'fair_up' and use the name found in your grep output
-    bids = compute_skewed_bids(up_shares=10, dn_shares=0, fair=0.5)
+    bids = compute_skewed_bids(
+       up_shares=10,
+       dn_shares=0,
+       up_bid=10,
+       dn_bid=0.5
+    )
     assert bids is not None
 
