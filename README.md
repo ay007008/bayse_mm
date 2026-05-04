@@ -107,7 +107,7 @@ Built and deployed during a live quantitative analyst interview process
 on the Bayse Markets platform. Pricing model derived from first 
 principles including an original Maclaurin series derivation of the 
 GBM solution — available on 
-[Substack](https://substack.com/@ayomideakinola1?utm_source=share&utm_medium=android&r=5xlptl).
+[Substack](https://open.substack.com/pub/ayomideakinola007/p/why-itos-correction-was-always-in?utm_source=share&utm_medium=android&r=5xlptl).
 
 ## Author
 
