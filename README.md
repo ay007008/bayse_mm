@@ -49,6 +49,25 @@ Three layered controls protect against adverse outcomes:
 - **Adverse selection detection** — fill-side asymmetry monitored over 
   a rolling window; above 70% one-sided fills triggers spread widening 
   or full pause
+## Live Performance
+
+Live trading session results from Bayse Markets platform:
+
+| Session | Starting Wallet | Ending Wallet | P&L |
+|---------|----------------|---------------|-----|
+| SOL/USD Apr 13 | $49.42 | $56.80 | +$7.38 |
+| SOL/USD Apr 13 | $51.78 | $54.89 | +$3.11 |
+| SOL/USD Apr 12 | $44.36 | $56.77 | +$12.41 |
+
+**Adverse selection detection confirmed in live conditions:**
+Fill asymmetry at 67% UP-dominant triggered automatic spread 
+widening and bid pause — engine responded correctly without 
+manual intervention.
+
+**Markets traded:** SOL/USD and EUR/GBP prediction pairs  
+**Resolution window:** 15-minute contracts  
+**Engine versions deployed:** v3, v4 (SOL MM)
+  
 
 ## Project Structure
 bayse_mm/
