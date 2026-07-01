@@ -1126,6 +1126,13 @@ def run() -> None:
             markup, _ = get_markup(minutes_left)
 
             # ── Inventory + skewing ───────────────────────────────────────────
+            T_minus_t = minutes_left / (365.0 * 24.0 * 60.0)
+            net_inventory = up_shares - dn_shares
+            gamma = 0.1
+            k = calibrate_k_from_fill_data()
+            spread = optimal_spread_AS(k, gamma, _live_vol, T_minus_t)
+            r_up = reservation_price_AS(fair_up, net_inventory, gamma, _live_vol, T_minus_t)
+            r_dn = reservation_price_AS(fair_dn, -net_inventory, gamma, _live_vol, T_minus_t)
             up_shares, dn_shares = get_inventory(up_outcome, dn_outcome)
             up_bid_raw = round(max(cfg.min_bid_price, min(cfg.max_bid_price, fair_up - markup)), 3)
             dn_bid_raw = round(max(cfg.min_bid_price, min(cfg.max_bid_price, fair_dn - markup)), 3)

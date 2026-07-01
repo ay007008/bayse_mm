@@ -1,0 +1,13 @@
+{
+  "id": "3f7a1b2c-d4e5-6789-abcd-ef0123456789",
+  "name": "Trading bot",
+  "publicKey": "pk_live_abcdef123456",
+  "secretKey": "sk_live_secret789xyz",
+  "signingInstructions": {
+    "algorithm": "HMAC-SHA256",
+    "headers": ["X-Public-Key", "X-Timestamp", "X-Signature"],
+    "payloadFormat": "{timestamp}.{method}.{path}.{bodyHash}",
+    "timestampWindowSeconds": 300
+  },
+  "createdAt": "2026-02-17T10:30:00Z"
+}
