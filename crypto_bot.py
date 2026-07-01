@@ -40,11 +40,27 @@ Changes from v5:
        Adverse selection / divergence guards apply PER LEVEL — if UP is
        paused, all four UP levels are skipped.
 
-  3. All v5 features retained unchanged:
+  3. Avellaneda-Stoikov inventory & spread model
+       Base bid prices for each side are no longer just `fair - markup`.
+       Instead:
+           • A reservation price r_up / r_dn is computed from the AS
+             formula r = s - q·γ·σ²·τ (scaled — see note in
+             optimal_spread_AS / reservation_price_AS), which shades
+             quotes away from the side we're already long.
+           • An AS-implied optimal half-spread δ* = γσ²τ + (2/γ)ln(1+γ/k)
+             is computed from live volatility and a calibrated order-
+             arrival decay constant k (fit from per-level fill data).
+           • The effective markup used for bidding is
+             max(vol/adverse markup, AS half-spread) — i.e. we never
+             quote tighter than either signal implies.
+       This replaces the old flat compute_skewed_bids() nudge with a
+       principled inventory-and-liquidity-aware quote. compute_skewed_bids
+       is left in the file, unused, for reference / A-B testing.
+
+  4. All v5 features retained unchanged:
        • Binance spot + perp WebSocket feeds
        • Market divergence guard (divergence_threshold = 0.15)
        • Early adverse scram (adverse_min_fills = 2)
-       • Inventory skewing (per-level bid prices are skewed individually)
        • Sliding liquidation markdown at close-out
        • Per-side circuit breaker (max_side_inventory_usd = 3.0)
        • Stop-loss (stop_loss_usd = 15.0)
@@ -122,7 +138,7 @@ class Config:
     # Market divergence guard
     divergence_threshold: float = 0.15
 
-    # Inventory skewing
+    # Inventory skewing (legacy — used only by unused compute_skewed_bids)
     skew_factor: float = 0.005
     max_skew:    float = 0.040
 
@@ -132,6 +148,13 @@ class Config:
     # Fair value (Binary Black-Scholes)
     sol_annual_vol: float = 0.80   # fallback if live vol fetch fails
     risk_free_rate: float = 0.00   # r=0 for prediction markets
+
+    # ── Avellaneda-Stoikov inventory/spread model ──────────────────────────
+    as_gamma:           float = 0.1     # risk aversion coefficient
+    as_k_fallback:      float = 1.5     # fallback order-arrival decay constant (cold start)
+    as_min_fills_for_k: int   = 6       # need this many total level-fills before trusting calibration
+    as_skew_amplifier:  float = 5000.0  # rescales γσ²τ (~1e-6 raw) into a sane 0-4c quote range
+    as_max_skew:        float = 0.04    # hard clamp, mirrors old cfg.max_skew
 
 
 cfg = Config()
@@ -269,9 +292,10 @@ def get_perp_signal(spot_price: float) -> tuple[float, str]:
     return premium_pct, signal
 
 
-# ── FILL TRACKER ──────────────────────────────────────────────────────────────
+# ── FILL TRACKERS ─────────────────────────────────────────────────────────────
 
 class FillTracker:
+    """Tracks UP/DN fill balance for adverse-selection detection."""
     def __init__(self):
         self.up_fills: deque = deque(maxlen=cfg.fill_window)
 
@@ -303,6 +327,39 @@ class FillTracker:
 
 
 fill_tracker = FillTracker()
+
+
+class LevelFillTracker:
+    """
+    Tracks placement attempts and fills per spread level (close/near/far/extreme)
+    so the Avellaneda-Stoikov order-arrival decay constant k can be calibrated
+    from real fill behavior:
+        λ(δ) ≈ A·e^(-k·δ)  →  ln(λ) = ln(A) - k·δ
+    k is estimated as the negative slope of ln(fill_count) vs. offset δ
+    across levels.
+    """
+    def __init__(self):
+        self.fills    = {name: 0 for name, _, _ in SPREAD_LEVELS}
+        self.attempts = {name: 0 for name, _, _ in SPREAD_LEVELS}
+
+    def record_attempt(self, level_name: str) -> None:
+        if level_name in self.attempts:
+            self.attempts[level_name] += 1
+
+    def record_fill(self, level_name: str) -> None:
+        if level_name in self.fills:
+            self.fills[level_name] += 1
+
+    def total_fills(self) -> int:
+        return sum(self.fills.values())
+
+    def reset(self) -> None:
+        for name in self.fills:
+            self.fills[name] = 0
+            self.attempts[name] = 0
+
+
+level_fill_tracker = LevelFillTracker()
 
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
@@ -442,16 +499,6 @@ def _fetch_market_detail(event_id: str, title: str) -> dict | None:
 #
 # The DN outcome pays $1 if SOL ≤ threshold, so:
 #   P(DN) = 1 - N(d2) = N(-d2)
-#
-# Key properties vs the old approach:
-#   • Old: approximated N(z) using a Horner polynomial on a hand-rolled z-score
-#          that scaled drift by vol/time. Correct concept, imprecise implementation.
-#   • New: textbook binary option formula — the de facto standard in financial
-#          mathematics for pricing exactly this kind of digital payout.
-#   • The (r - ½σ²)·τ term is the Itô correction — it accounts for the fact
-#          that under log-normal diffusion, the expected LOG price drifts at
-#          r - ½σ² rather than r. Omitting it (as the old code effectively did)
-#          introduces a small but systematic mispricing that grows with σ and τ.
 #
 # Sanity clamp: [0.05, 0.95] — no outcome trades at absolute certainty.
 
@@ -597,7 +644,7 @@ def get_liquidation_markdown(minutes_left: float) -> float:
     return 0.35
 
 
-# ── INVENTORY SKEWING ─────────────────────────────────────────────────────────
+# ── LEGACY INVENTORY SKEWING (unused — kept for reference / A-B testing) ─────
 
 def compute_skewed_bids(
     up_bid: float, dn_bid: float,
@@ -622,6 +669,89 @@ def compute_skewed_bids(
             f"{dn_bid:.3f} → {dn_bid_out:.3f} (-{skew:.3f})"
         )
     return up_bid_out, dn_bid_out
+
+
+# ── AVELLANEDA-STOIKOV INVENTORY & SPREAD MODEL ───────────────────────────────
+#
+# Classic AS quoting model, adapted for a probability-priced (0-1), short
+# horizon (15min) prediction market:
+#
+#   Reservation price:   r = s - q·γ·σ²·τ
+#   Optimal half-spread: δ* = γσ²τ + (2/γ)·ln(1 + γ/k)
+#
+# where:
+#   s      = mid/fair price (fair_up or fair_dn)
+#   q      = signed inventory (net_inventory, or its negative for the other side)
+#   γ      = risk aversion coefficient (cfg.as_gamma)
+#   σ      = live annualised volatility (_live_vol)
+#   τ      = time to expiry in years
+#   k      = order-arrival decay constant, calibrated from per-level fill data
+#
+# Scaling note: because price here is a probability in [0,1] and τ is a
+# fraction of a year for a 15-minute window (~2.8e-5), the raw γσ²τ term is
+# on the order of 1e-6 — invisible next to a $0.50 quote. cfg.as_skew_amplifier
+# rescales this back into the same 0-4c range the old flat skew_factor used,
+# and cfg.as_max_skew hard-clamps the result so a bad calibration or vol
+# spike can't produce a nonsensical quote.
+
+def calibrate_k_from_fill_data() -> float:
+    """
+    Fits the AS order-arrival decay constant k via linear regression of
+    ln(fill_count) on level offset across close/near/far/extreme:
+        λ(δ) ≈ A·e^(-k·δ)  →  ln(λ) = ln(A) - k·δ
+    k is the negative slope of that regression.
+
+    Falls back to cfg.as_k_fallback until enough fills have accumulated —
+    a 1-2 point regression is noise, not signal, and shouldn't be trusted
+    to drive live quoting.
+    """
+    points = [
+        (offset, level_fill_tracker.fills[name])
+        for name, offset, _ in SPREAD_LEVELS
+        if level_fill_tracker.fills[name] > 0
+    ]
+    if level_fill_tracker.total_fills() < cfg.as_min_fills_for_k or len(points) < 2:
+        return cfg.as_k_fallback
+
+    xs = [p[0] for p in points]
+    ys = [math.log(p[1]) for p in points]
+    n  = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    var_x  = sum((x - mean_x) ** 2 for x in xs)
+    if var_x == 0:
+        return cfg.as_k_fallback
+
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / var_x
+    k = max(0.1, min(10.0, -slope))   # k = -slope; clamp to a sane range
+    log.info(f"AS calibration: k={k:.4f} from points={points}")
+    return k
+
+
+def optimal_spread_AS(k: float, gamma: float, sigma: float, tau: float) -> float:
+    """
+    Avellaneda-Stoikov optimal half-spread:
+        δ* = γσ²τ·amplifier + (2/γ)·ln(1 + γ/k)
+    Clamped into [markup_floor, 2×markup_wide] so a stale k or a vol spike
+    can't push the quoted spread outside a sane range for this market.
+    """
+    inventory_term = gamma * (sigma ** 2) * tau * cfg.as_skew_amplifier
+    liquidity_term = (2.0 / gamma) * math.log(1.0 + gamma / k)
+    raw_spread = inventory_term + liquidity_term
+    return max(cfg.markup_floor, min(cfg.markup_wide * 2, raw_spread))
+
+
+def reservation_price_AS(mid_price: float, inventory: float, gamma: float, sigma: float, tau: float) -> float:
+    """
+    Avellaneda-Stoikov reservation price:
+        r = s - q·γ·σ²·τ·amplifier
+    Positive inventory (long that outcome) shades the reservation price
+    DOWN, discouraging further buys and encouraging the book to unload it.
+    Clamped to [0.01, 0.99] to stay a valid probability quote.
+    """
+    raw_adjustment = inventory * gamma * (sigma ** 2) * tau * cfg.as_skew_amplifier
+    adjustment = max(-cfg.as_max_skew, min(cfg.as_max_skew, raw_adjustment))
+    return max(0.01, min(0.99, mid_price - adjustment))
 
 
 # ── TIME TO CLOSE ─────────────────────────────────────────────────────────────
@@ -696,10 +826,10 @@ def burn_shares(market_id: str, quantity: int) -> float:
 #   extreme   +0.050                      10 %
 #
 # Each level gets its own limit order posted at:
-#   bid_price = fair_price - base_markup - level_offset
+#   bid_price = base_bid_price - level_offset
 #
-# Inventory skew is applied to the BASE bid price; the level offsets are
-# applied AFTER skewing so each level preserves its relative depth.
+# base_bid_price already incorporates the AS reservation price and the
+# effective (max of vol-markup / AS-spread) markup — see run().
 #
 # A level is skipped if its allocated notional falls below min_notional
 # (the exchange minimum), preventing rejected tiny orders.
@@ -709,7 +839,7 @@ def burn_shares(market_id: str, quantity: int) -> float:
 def place_multilevel_bids(
     event_id: str, market_id: str, outcome_id: str,
     side_label: str,
-    base_bid_price: float,        # fair - base_markup (already skewed)
+    base_bid_price: float,        # reservation price - effective markup
     total_notional: float,        # cfg.bid_amount_usd
     min_notional: float,
 ) -> dict:
@@ -745,6 +875,7 @@ def place_multilevel_bids(
             amount=level_notional,
         )
         if oid:
+            level_fill_tracker.record_attempt(level_name)
             new_orders[oid] = {
                 "label":       side_label,          # "UP" or "DN" — for fill tracker
                 "level":       level_name,
@@ -909,7 +1040,8 @@ def process_active_orders(active: dict) -> dict:
             cost              = new_fill * info["avg_fill_price"]
             session_bid_cost += cost
             meta["prev_filled"] = filled
-            fill_tracker.record_fill(meta["label"])   # "UP" or "DN"
+            fill_tracker.record_fill(meta["label"])                    # "UP" or "DN"
+            level_fill_tracker.record_fill(meta.get("level", "close")) # for AS k calibration
             log.info(
                 f"  ✔ Fill | BID {meta['label']}/{meta.get('level','?')} | "
                 f"+{new_fill:.4f}sh @ {info['avg_fill_price']:.4f} | "
@@ -998,10 +1130,12 @@ def run() -> None:
     log.info("=" * 62)
     log.info("  Bayse SOL/USDT 15-Min Market Maker  v6")
     log.info("  Binary Black-Scholes pricer | 4-level bid spreading")
+    log.info("  Avellaneda-Stoikov reservation price + optimal spread")
     log.info("  Spot WS + Perp WS | Divergence guard | Early adverse scram")
     log.info(f"  markup_mid={cfg.markup_mid} | max_side=${cfg.max_side_inventory_usd} | sleep={cfg.reprice_interval_s}s")
     log.info(f"  close_out={cfg.close_out_mins}min | adverse_thresh={cfg.adverse_threshold} | stop_loss=${cfg.stop_loss_usd}")
     log.info(f"  divergence_threshold={cfg.divergence_threshold} | adverse_min_fills={cfg.adverse_min_fills}")
+    log.info(f"  AS: gamma={cfg.as_gamma} k_fallback={cfg.as_k_fallback} amplifier={cfg.as_skew_amplifier}")
     log.info(f"  Spread levels: {[(l, f'offset={o:.3f}', f'frac={f:.0%}') for l, o, f in SPREAD_LEVELS]}")
     log.info("=" * 62)
 
@@ -1050,6 +1184,7 @@ def run() -> None:
                 active_orders.clear()
                 last_fair_up = None
                 fill_tracker.reset()
+                level_fill_tracker.reset()
                 prior_pnl = compute_net_pnl(0, 0, 0.5)
                 market_history.append({
                     "market_id":  last_market_id,
@@ -1122,22 +1257,32 @@ def run() -> None:
                 time.sleep(max(60, int(minutes_left * 60) + 60))
                 continue
 
-            # ── Markup ────────────────────────────────────────────────────────
+            # ── Markup (vol / adverse-selection based) ─────────────────────────
             markup, _ = get_markup(minutes_left)
 
-            # ── Inventory + skewing ───────────────────────────────────────────
-            T_minus_t = minutes_left / (365.0 * 24.0 * 60.0)
+            # ── Inventory + Avellaneda-Stoikov reservation price & spread ──────
+            up_shares, dn_shares = get_inventory(up_outcome, dn_outcome)   # fetch BEFORE use
+
+            T_minus_t     = minutes_left / (365.0 * 24.0 * 60.0)
             net_inventory = up_shares - dn_shares
-            gamma = 0.1
-            k = calibrate_k_from_fill_data()
-            spread = optimal_spread_AS(k, gamma, _live_vol, T_minus_t)
+            gamma         = cfg.as_gamma
+            k             = calibrate_k_from_fill_data()
+            as_half_spread = optimal_spread_AS(k, gamma, _live_vol, T_minus_t)
+
             r_up = reservation_price_AS(fair_up, net_inventory, gamma, _live_vol, T_minus_t)
             r_dn = reservation_price_AS(fair_dn, -net_inventory, gamma, _live_vol, T_minus_t)
-            up_shares, dn_shares = get_inventory(up_outcome, dn_outcome)
-            up_bid_raw = round(max(cfg.min_bid_price, min(cfg.max_bid_price, fair_up - markup)), 3)
-            dn_bid_raw = round(max(cfg.min_bid_price, min(cfg.max_bid_price, fair_dn - markup)), 3)
-            up_bid_base, dn_bid_base = compute_skewed_bids(
-                up_bid_raw, dn_bid_raw, up_shares, dn_shares
+
+            # Never quote tighter than either the vol/adverse-selection markup
+            # or the AS-implied half-spread — take whichever is wider.
+            effective_markup = max(markup, as_half_spread)
+
+            up_bid_base = round(max(cfg.min_bid_price, min(cfg.max_bid_price, r_up - effective_markup)), 3)
+            dn_bid_base = round(max(cfg.min_bid_price, min(cfg.max_bid_price, r_dn - effective_markup)), 3)
+
+            log.info(
+                f"AS | k={k:.3f} γ={gamma} τ={T_minus_t*525600:.1f}min | "
+                f"r_up={r_up:.4f} r_dn={r_dn:.4f} | half_spread={as_half_spread:.4f} "
+                f"(markup={markup:.4f}) | net_inv={net_inventory:+.2f}sh"
             )
 
             # ── Profit check: use the close-level (tightest) bid ──────────────
@@ -1289,7 +1434,6 @@ def run() -> None:
 
         log.info("=== SOL MM v6 stopped ===")
 
+
 if __name__ == "__main__":
-    _spot_feed = _WSFeed("wss://stream.binance.com:9443/ws/solusdt@aggTrade","Binance-spot")
-    _perp_feed = _WSFeed("wss://fstream.binance.com/ws/solusdt@aggTrade","Binance-perp")
-    run_bot()
+    run()
