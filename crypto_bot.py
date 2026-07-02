@@ -130,7 +130,7 @@ class Config:
     near_expiry_mins: float = 5.0
 
     # Adverse selection
-    adverse_threshold:  float = 0.65
+    adverse_threshold:  float = 0.55
     adverse_multiplier: float = 1.50
     fill_window:        int   = 4
     adverse_min_fills:  int   = 2
@@ -1351,8 +1351,8 @@ def run() -> None:
                     place_dn = False
                     log.warning(f"SKIP BID DN (divergence guard: {div_reason})")
 
-                up_exposure = up_shares * up_bid_base
-                dn_exposure = dn_shares * dn_bid_base
+                up_exposure = session_bid_cost
+                dn_exposure = session_bid_cost
                 if up_exposure >= cfg.max_side_inventory_usd:
                     log.warning(
                         f"Circuit breaker: UP exposure ${up_exposure:.2f} "
