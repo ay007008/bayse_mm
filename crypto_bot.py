@@ -1351,6 +1351,13 @@ def run() -> None:
                     place_dn = False
                     log.warning(f"SKIP BID DN (divergence guard: {div_reason})")
 
+                # Deep OTM suppression
+                if fair_up < 0.08 and minutes_left < 10:
+                    place_up = False
+                    log.warning(f"Deep OTM suppression: fair_up={fair_up:.3f} with {minutes_left:.1f}min left")
+                if (1.0 - fair_up) < 0.08 and minutes_left < 10:
+                    place_dn = False
+                    log.warning(f"Deep OTM suppression: fair_dn={1-fair_up:.3f} with {minutes_left:.1f}min left")
                 up_exposure = session_bid_cost
                 dn_exposure = session_bid_cost
                 if up_exposure >= cfg.max_side_inventory_usd:
